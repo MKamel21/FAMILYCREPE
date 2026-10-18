@@ -1,0 +1,12 @@
+{
+  "name": "fc-family-crepe",
+  "private": true,
+  "type": "module",
+  "description": "Site de commande FC Family Crêpe (Netlify + SumUp)",
+  "dependencies": {
+    "@netlify/blobs": "^11.1.4"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
