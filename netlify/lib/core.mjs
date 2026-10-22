@@ -3,7 +3,7 @@
 // (prix, créneaux, stockage, sécurité, SumUp)
 // ============================================================
 import { getStore } from '@netlify/blobs';
-import { createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
+import { createHmac, timingSafeEqual, randomBytes, scryptSync } from 'node:crypto';
 import { MENU } from './menu.mjs';
 
 // ---------- Réponses ----------
@@ -50,20 +50,41 @@ export async function nextNumber() {
 }
 
 // ---------- Réglages ----------
-export const DEFAULT_CFG = { cap: 3, open: '11:00', close: '22:00', step: 10 };
-export async function getConfig() {
-  const c = await db().get('meta/config', { type: 'json' });
-  return { ...DEFAULT_CFG, ...(c || {}), step: 10 };
+// Horaires par jour (0 = dimanche … 6 = samedi), plusieurs plages possibles. "24:00" = minuit.
+const MIDI_SOIR = [['12:00', '14:00'], ['17:00', '23:00']];
+export const DEFAULT_HOURS = {
+  0: [], 1: MIDI_SOIR, 2: MIDI_SOIR, 3: [['12:00', '14:00'], ['18:00', '23:00']],
+  4: MIDI_SOIR, 5: MIDI_SOIR, 6: [['16:00', '24:00']],
+};
+export const DEFAULT_CFG = { cap: 3, step: 10, hours: DEFAULT_HOURS };
+const HM = /^(([01]\d|2[0-3]):[0-5]\d|24:00)$/;
+const toMin = (hm) => { const [h, m] = hm.split(':').map(Number); return h * 60 + m; };
+function cleanHours(hours) {
+  const out = {};
+  for (let d = 0; d < 7; d++) {
+    const list = Array.isArray(hours?.[d]) ? hours[d] : [];
+    out[d] = list
+      .filter((r) => Array.isArray(r) && HM.test(r[0]) && HM.test(r[1]) && toMin(r[1]) > toMin(r[0]))
+      .slice(0, 4).map((r) => [r[0], r[1]]);
+  }
+  return out;
 }
-export async function setConfig({ cap, open, close }) {
-  const t = /^([01]\d|2[0-3]):[0-5]\d$/;
-  const c = {
-    cap: Math.max(1, Math.min(20, parseInt(cap) || 3)),
-    open: t.test(open) ? open : DEFAULT_CFG.open,
-    close: t.test(close) ? close : DEFAULT_CFG.close,
-  };
+export async function getConfig() {
+  const c = (await db().get('meta/config', { type: 'json' })) || {};
+  return { cap: c.cap || DEFAULT_CFG.cap, step: 10, hours: c.hours ? cleanHours(c.hours) : DEFAULT_HOURS };
+}
+export async function setConfig({ cap, hours }) {
+  const c = { cap: Math.max(1, Math.min(20, parseInt(cap) || 3)), hours: cleanHours(hours) };
   await db().setJSON('meta/config', c);
   return { ...c, step: 10 };
+}
+// Le retrait tombe-t-il dans une plage d'ouverture (heure de Bruxelles) ?
+const WD = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+function inHours(cfg, pickup) {
+  const wd = WD[new Intl.DateTimeFormat('en-US', { timeZone: TZ, weekday: 'short' }).format(new Date(pickup))];
+  const mins = toMin(brusselsHHMM(pickup));
+  const ok = (d, m) => (cfg.hours[d] || []).some(([o, c]) => m >= toMin(o) + cfg.step && m <= toMin(c));
+  return ok(wd, mins) || (mins === 0 && ok((wd + 6) % 7, 1440)); // 00:00 = fin de la soirée de la veille
 }
 
 // ---------- Prix (recalculés côté serveur : le client ne peut pas tricher) ----------
@@ -140,10 +161,8 @@ function fits(load, cfg, t, need, now) {
 export function checkPickup(orders, cfg, pickup, need, now = Date.now()) {
   const st = cfg.step * 60000;
   if (!Number.isFinite(pickup) || pickup % st !== 0) return 'Créneau invalide';
-  if (pickup < firstSlot(cfg, now) || pickup > now + 2 * 86400000) return 'Créneau dépassé';
-  const hm = brusselsHHMM(pickup), [oh, om] = cfg.open.split(':').map(Number);
-  const openPlus = `${String(oh + Math.floor((om + cfg.step) / 60)).padStart(2, '0')}:${String((om + cfg.step) % 60).padStart(2, '0')}`;
-  if (hm < openPlus || hm > cfg.close) return 'En dehors des heures d’ouverture';
+  if (pickup < firstSlot(cfg, now) || pickup > now + 3 * 86400000) return 'Créneau dépassé';
+  if (!inHours(cfg, pickup)) return 'En dehors des heures d’ouverture';
   if (!fits(loadMap(busyList(orders, now), cfg), cfg, pickup, need, now)) return 'slot_full';
   return null;
 }
@@ -162,30 +181,69 @@ export const publicView = (o) => ({
 });
 
 // ---------- Accès gérant : code PIN vérifié ici, jamais dans la page ----------
-const pinConfigured = () => /^\d{4}$/.test(process.env.ADMIN_PIN || '');
-const secret = () => `${process.env.ADMIN_PIN}|${process.env.SESSION_SECRET || process.env.SUMUP_API_KEY || 'fc'}`;
-const sign = (exp) => createHmac('sha256', secret()).update(`fc-admin:${exp}`).digest('hex');
+// Le PIN de départ vient de la variable Netlify ADMIN_PIN.
+// Le gérant peut ensuite le changer depuis « Réglages » : il est alors stocké chiffré (scrypt).
+// Secours en cas d'oubli : modifier ADMIN_PIN sur Netlify et redéployer → ce code redevient le PIN.
+const envPin = () => (/^\d{4}$/.test(process.env.ADMIN_PIN || '') ? process.env.ADMIN_PIN : null);
+const envTag = () => createHmac('sha256', 'fc-env').update(String(process.env.ADMIN_PIN || '')).digest('hex');
+const scrypt = (pin, salt) => scryptSync(String(pin), salt, 32).toString('hex');
 const safeEq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && timingSafeEqual(x, y); };
 
-export async function login(pin, stay) {
-  if (!pinConfigured()) return { status: 500, error: 'Le code PIN (ADMIN_PIN) n’est pas encore configuré sur Netlify.' };
+// PIN actif : celui enregistré par le gérant, sauf si ADMIN_PIN a été changé depuis (= réinitialisation)
+async function pinState() {
+  const rec = await db().get('meta/pin', { type: 'json' });
+  if (rec && rec.envTag === envTag()) return { rec, version: rec.v };
+  return envPin() ? { rec: null, version: 0 } : null;
+}
+async function checkPin(pin, st) {
+  if (st.rec) return safeEq(scrypt(pin, st.rec.salt), st.rec.hash);
+  return safeEq(pin, envPin());
+}
+const secret = (version) => `${version}|${process.env.ADMIN_PIN}|${process.env.SESSION_SECRET || process.env.SUMUP_API_KEY || 'fc'}`;
+const sign = (exp, version) => createHmac('sha256', secret(version)).update(`fc-admin:${exp}`).digest('hex');
+const makeToken = (stay, version) => { const exp = Date.now() + (stay ? 30 : 1) * 86400000; return `${exp}.${sign(exp, version)}`; };
+
+// Compteur d'essais : 8 erreurs → blocage 10 minutes (connexion et changement de PIN)
+async function guarded(fn) {
   const store = db(), lock = (await store.get('meta/lock', { type: 'json' })) || { fails: 0, until: 0 };
   if (lock.until > Date.now()) return { status: 429, error: 'Trop d’essais.', until: lock.until };
-  if (!safeEq(pin, process.env.ADMIN_PIN)) {
+  const ok = await fn();
+  if (!ok) {
     lock.fails = (lock.fails || 0) + 1;
     if (lock.fails >= 8) { lock.fails = 0; lock.until = Date.now() + 10 * 60000; }
     await store.setJSON('meta/lock', lock);
     return { status: 401, error: 'Code PIN incorrect.', until: lock.until > Date.now() ? lock.until : undefined };
   }
   await store.setJSON('meta/lock', { fails: 0, until: 0 });
-  const exp = Date.now() + (stay ? 30 : 1) * 86400000;
-  return { status: 200, token: `${exp}.${sign(exp)}` };
+  return null;
 }
-export function isAdmin(req) {
-  if (!pinConfigured()) return false;
+
+export async function login(pin, stay) {
+  const st = await pinState();
+  if (!st) return { status: 500, error: 'Le code PIN (ADMIN_PIN) n’est pas encore configuré sur Netlify.' };
+  const err = await guarded(() => checkPin(pin, st));
+  if (err) return err;
+  return { status: 200, token: makeToken(stay, st.version) };
+}
+export async function isAdmin(req) {
+  const st = await pinState();
+  if (!st) return false;
   const tok = (req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
   const [exp, sig] = tok.split('.');
-  return Number(exp) > Date.now() && !!sig && safeEq(sig, sign(exp));
+  return Number(exp) > Date.now() && !!sig && safeEq(sig, sign(exp, st.version));
+}
+const WEAK = ['0000', '1111', '2222', '3333', '4444', '5555', '6666', '7777', '8888', '9999', '1234', '4321', '0123', '1212'];
+export async function changePin(current, next, stay) {
+  const st = await pinState();
+  if (!st) return { status: 500, error: 'Code PIN non configuré.' };
+  if (!/^\d{4}$/.test(String(next))) return { status: 400, error: 'Le nouveau code doit faire 4 chiffres.' };
+  if (WEAK.includes(String(next))) return { status: 400, error: 'Code trop facile à deviner, choisis-en un autre.' };
+  const err = await guarded(() => checkPin(current, st));
+  if (err) return { ...err, error: err.status === 401 ? 'Code PIN actuel incorrect.' : err.error };
+  if (String(current) === String(next)) return { status: 400, error: 'Le nouveau code est identique à l’ancien.' };
+  const salt = randomBytes(16).toString('hex'), v = (st.version || 0) + 1;
+  await db().setJSON('meta/pin', { salt, hash: scrypt(next, salt), v, envTag: envTag(), changedAt: new Date().toISOString() });
+  return { status: 200, token: makeToken(stay, v) }; // les autres appareils devront retaper le nouveau code
 }
 
 // ---------- SumUp ----------
